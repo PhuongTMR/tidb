@@ -48,42 +48,63 @@ type ScalarFunction struct {
 // VecEvalInt evaluates this expression in a vectorized manner.
 func (sf *ScalarFunction) VecEvalInt(ctx EvalContext, input *chunk.Chunk, result *chunk.Column) error {
 	intest.Assert(ctx != nil)
+	if intest.InTest {
+		ctx = wrapEvalAssert(ctx, sf.Function)
+	}
 	return sf.Function.vecEvalInt(ctx, input, result)
 }
 
 // VecEvalReal evaluates this expression in a vectorized manner.
 func (sf *ScalarFunction) VecEvalReal(ctx EvalContext, input *chunk.Chunk, result *chunk.Column) error {
 	intest.Assert(ctx != nil)
+	if intest.InTest {
+		ctx = wrapEvalAssert(ctx, sf.Function)
+	}
 	return sf.Function.vecEvalReal(ctx, input, result)
 }
 
 // VecEvalString evaluates this expression in a vectorized manner.
 func (sf *ScalarFunction) VecEvalString(ctx EvalContext, input *chunk.Chunk, result *chunk.Column) error {
 	intest.Assert(ctx != nil)
+	if intest.InTest {
+		ctx = wrapEvalAssert(ctx, sf.Function)
+	}
 	return sf.Function.vecEvalString(ctx, input, result)
 }
 
 // VecEvalDecimal evaluates this expression in a vectorized manner.
 func (sf *ScalarFunction) VecEvalDecimal(ctx EvalContext, input *chunk.Chunk, result *chunk.Column) error {
 	intest.Assert(ctx != nil)
+	if intest.InTest {
+		ctx = wrapEvalAssert(ctx, sf.Function)
+	}
 	return sf.Function.vecEvalDecimal(ctx, input, result)
 }
 
 // VecEvalTime evaluates this expression in a vectorized manner.
 func (sf *ScalarFunction) VecEvalTime(ctx EvalContext, input *chunk.Chunk, result *chunk.Column) error {
 	intest.Assert(ctx != nil)
+	if intest.InTest {
+		ctx = wrapEvalAssert(ctx, sf.Function)
+	}
 	return sf.Function.vecEvalTime(ctx, input, result)
 }
 
 // VecEvalDuration evaluates this expression in a vectorized manner.
 func (sf *ScalarFunction) VecEvalDuration(ctx EvalContext, input *chunk.Chunk, result *chunk.Column) error {
 	intest.Assert(ctx != nil)
+	if intest.InTest {
+		ctx = wrapEvalAssert(ctx, sf.Function)
+	}
 	return sf.Function.vecEvalDuration(ctx, input, result)
 }
 
 // VecEvalJSON evaluates this expression in a vectorized manner.
 func (sf *ScalarFunction) VecEvalJSON(ctx EvalContext, input *chunk.Chunk, result *chunk.Column) error {
 	intest.Assert(ctx != nil)
+	if intest.InTest {
+		ctx = wrapEvalAssert(ctx, sf.Function)
+	}
 	return sf.Function.vecEvalJSON(ctx, input, result)
 }
 
@@ -127,7 +148,7 @@ func (sf *ScalarFunction) MarshalJSON() ([]byte, error) {
 
 // typeInferForNull infers the NULL constants field type and set the field type
 // of NULL constant same as other non-null operands.
-func typeInferForNull(args []Expression) {
+func typeInferForNull(ctx EvalContext, args []Expression) {
 	if len(args) < 2 {
 		return
 	}
@@ -141,7 +162,7 @@ func typeInferForNull(args []Expression) {
 	for i := len(args) - 1; i >= 0; i-- {
 		isNullArg := isNull(args[i])
 		if !isNullArg && retFieldTp == nil {
-			retFieldTp = args[i].GetType()
+			retFieldTp = args[i].GetType(ctx)
 		}
 		hasNullArg = hasNullArg || isNullArg
 		// Break if there are both NULL and non-NULL expression
@@ -154,8 +175,8 @@ func typeInferForNull(args []Expression) {
 	}
 	for _, arg := range args {
 		if isNull(arg) {
-			*arg.GetType() = *retFieldTp
-			arg.GetType().DelFlag(mysql.NotNullFlag) // Remove NotNullFlag of NullConst
+			*arg.GetType(ctx) = *retFieldTp
+			arg.GetType(ctx).DelFlag(mysql.NotNullFlag) // Remove NotNullFlag of NullConst
 		}
 	}
 }
@@ -180,11 +201,11 @@ func newFunctionImpl(ctx BuildContext, fold int, funcName string, retType *types
 	case ast.GetVar:
 		return BuildGetVarFunction(ctx, args[0], retType)
 	case InternalFuncFromBinary:
-		return BuildFromBinaryFunction(ctx, args[0], retType), nil
+		return BuildFromBinaryFunction(ctx, args[0], retType, false), nil
 	case InternalFuncToBinary:
 		return BuildToBinaryFunction(ctx, args[0]), nil
 	case ast.Sysdate:
-		if ctx.GetSessionVars().SysdateIsNow {
+		if ctx.GetSysdateIsNow() {
 			funcName = ast.Now
 		}
 	}
@@ -197,13 +218,13 @@ func newFunctionImpl(ctx BuildContext, fold int, funcName string, retType *types
 	}
 
 	if !ok {
-		db := ctx.CurrentDB()
+		db := ctx.GetEvalCtx().CurrentDB()
 		if db == "" {
 			return nil, errors.Trace(plannererrors.ErrNoDB)
 		}
 		return nil, ErrFunctionNotExists.GenWithStackByArgs("FUNCTION", db+"."+funcName)
 	}
-	noopFuncsMode := ctx.GetSessionVars().NoopFuncsMode
+	noopFuncsMode := ctx.GetNoopFuncsMode()
 	if noopFuncsMode != variable.OnInt {
 		if _, ok := noopFuncs[funcName]; ok {
 			err := ErrFunctionsNoopImpl.FastGenByArgs(funcName)
@@ -211,7 +232,7 @@ func newFunctionImpl(ctx BuildContext, fold int, funcName string, retType *types
 				return nil, errors.Trace(err)
 			}
 			// NoopFuncsMode is Warn, append an error
-			ctx.GetSessionVars().StmtCtx.AppendWarning(err)
+			ctx.GetEvalCtx().AppendWarning(err)
 		}
 	}
 	funcArgs := make([]Expression, len(args))
@@ -224,7 +245,7 @@ func newFunctionImpl(ctx BuildContext, fold int, funcName string, retType *types
 		// For example, expression ('abc', 1) = (null, 0). Null's type should be STRING, not INT.
 		// The type infer happens when converting the expression to ('abc' = null) and (1 = 0).
 	default:
-		typeInferForNull(funcArgs)
+		typeInferForNull(ctx.GetEvalCtx(), funcArgs)
 	}
 
 	f, err := fc.getFunction(ctx, funcArgs)
@@ -243,12 +264,12 @@ func newFunctionImpl(ctx BuildContext, fold int, funcName string, retType *types
 		return FoldConstant(ctx, sf), nil
 	} else if fold == -1 {
 		// try to fold constants, and return the original function if errors/warnings occur
-		sc := ctx.GetSessionVars().StmtCtx
-		beforeWarns := sc.WarningCount()
+		evalCtx := ctx.GetEvalCtx()
+		beforeWarns := evalCtx.WarningCount()
 		newSf := FoldConstant(ctx, sf)
-		afterWarns := sc.WarningCount()
+		afterWarns := evalCtx.WarningCount()
 		if afterWarns > beforeWarns {
-			sc.TruncateWarnings(int(beforeWarns))
+			evalCtx.TruncateWarnings(beforeWarns)
 			return sf, nil
 		}
 		return newSf, nil
@@ -325,7 +346,12 @@ func (sf *ScalarFunction) Clone() Expression {
 }
 
 // GetType implements Expression interface.
-func (sf *ScalarFunction) GetType() *types.FieldType {
+func (sf *ScalarFunction) GetType(_ EvalContext) *types.FieldType {
+	return sf.GetStaticType()
+}
+
+// GetStaticType returns the static type of the scalar function.
+func (sf *ScalarFunction) GetStaticType() *types.FieldType {
 	return sf.RetType
 }
 
@@ -337,6 +363,9 @@ func (sf *ScalarFunction) Equal(ctx EvalContext, e Expression) bool {
 		return false
 	}
 	if sf.FuncName.L != fun.FuncName.L {
+		return false
+	}
+	if !sf.RetType.Equal(fun.RetType) {
 		return false
 	}
 	return sf.Function.equal(ctx, fun.Function)
@@ -399,7 +428,7 @@ func (sf *ScalarFunction) Eval(ctx EvalContext, row chunk.Row) (d types.Datum, e
 		isNull bool
 	)
 	intest.AssertNotNil(ctx)
-	switch tp, evalType := sf.GetType(), sf.GetType().EvalType(); evalType {
+	switch tp, evalType := sf.GetType(ctx), sf.GetType(ctx).EvalType(); evalType {
 	case types.ETInt:
 		var intRes int64
 		intRes, isNull, err = sf.EvalInt(ctx, row)
@@ -441,42 +470,63 @@ func (sf *ScalarFunction) Eval(ctx EvalContext, row chunk.Row) (d types.Datum, e
 // EvalInt implements Expression interface.
 func (sf *ScalarFunction) EvalInt(ctx EvalContext, row chunk.Row) (int64, bool, error) {
 	intest.Assert(ctx != nil)
+	if intest.InTest {
+		ctx = wrapEvalAssert(ctx, sf.Function)
+	}
 	return sf.Function.evalInt(ctx, row)
 }
 
 // EvalReal implements Expression interface.
 func (sf *ScalarFunction) EvalReal(ctx EvalContext, row chunk.Row) (float64, bool, error) {
 	intest.Assert(ctx != nil)
+	if intest.InTest {
+		ctx = wrapEvalAssert(ctx, sf.Function)
+	}
 	return sf.Function.evalReal(ctx, row)
 }
 
 // EvalDecimal implements Expression interface.
 func (sf *ScalarFunction) EvalDecimal(ctx EvalContext, row chunk.Row) (*types.MyDecimal, bool, error) {
 	intest.Assert(ctx != nil)
+	if intest.InTest {
+		ctx = wrapEvalAssert(ctx, sf.Function)
+	}
 	return sf.Function.evalDecimal(ctx, row)
 }
 
 // EvalString implements Expression interface.
 func (sf *ScalarFunction) EvalString(ctx EvalContext, row chunk.Row) (string, bool, error) {
 	intest.Assert(ctx != nil)
+	if intest.InTest {
+		ctx = wrapEvalAssert(ctx, sf.Function)
+	}
 	return sf.Function.evalString(ctx, row)
 }
 
 // EvalTime implements Expression interface.
 func (sf *ScalarFunction) EvalTime(ctx EvalContext, row chunk.Row) (types.Time, bool, error) {
 	intest.Assert(ctx != nil)
+	if intest.InTest {
+		ctx = wrapEvalAssert(ctx, sf.Function)
+	}
 	return sf.Function.evalTime(ctx, row)
 }
 
 // EvalDuration implements Expression interface.
 func (sf *ScalarFunction) EvalDuration(ctx EvalContext, row chunk.Row) (types.Duration, bool, error) {
 	intest.Assert(ctx != nil)
+	if intest.InTest {
+		ctx = wrapEvalAssert(ctx, sf.Function)
+	}
 	return sf.Function.evalDuration(ctx, row)
 }
 
 // EvalJSON implements Expression interface.
 func (sf *ScalarFunction) EvalJSON(ctx EvalContext, row chunk.Row) (types.BinaryJSON, bool, error) {
 	intest.Assert(ctx != nil)
+	if intest.InTest {
+		ctx = wrapEvalAssert(ctx, sf.Function)
+	}
 	return sf.Function.evalJSON(ctx, row)
 }
 

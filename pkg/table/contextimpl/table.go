@@ -29,12 +29,26 @@ var _ context.AllocatorContext = &TableContextImpl{}
 // TableContextImpl is used to provide context for table operations.
 type TableContextImpl struct {
 	sessionctx.Context
-	exprCtx exprctx.BuildContext
+	exprCtx exprctx.ExprContext
+
+	// TablesBuffer is a memory pool for table related memory allocation that aims to reuse memory
+	// and saves allocation
+	// The buffers are supposed to be used inside AddRecord/UpdateRecord/RemoveRecord.
+	// It's users duty to reset them before use.
+	TablesBuffer *context.TablesBuffer
 }
 
 // NewTableContextImpl creates a new TableContextImpl.
-func NewTableContextImpl(sctx sessionctx.Context, exprCtx exprctx.BuildContext) *TableContextImpl {
-	return &TableContextImpl{Context: sctx, exprCtx: exprCtx}
+func NewTableContextImpl(sctx sessionctx.Context, exprCtx exprctx.ExprContext) *TableContextImpl {
+	return &TableContextImpl{
+		Context: sctx,
+		exprCtx: exprCtx,
+		TablesBuffer: &context.TablesBuffer{
+			Add:    &context.AddRecordBuffer{},
+			Update: &context.UpdateRecordBuffer{},
+			Remove: &context.RemoveRecordBuffer{},
+		},
+	}
 }
 
 // TxnRecordTempTable record the temporary table to the current transaction.
@@ -44,10 +58,15 @@ func (ctx *TableContextImpl) TxnRecordTempTable(tbl *model.TableInfo) tableutil.
 }
 
 // GetExprCtx returns the ExprContext
-func (ctx *TableContextImpl) GetExprCtx() exprctx.BuildContext {
+func (ctx *TableContextImpl) GetExprCtx() exprctx.ExprContext {
 	return ctx.exprCtx
 }
 
 func (ctx *TableContextImpl) vars() *variable.SessionVars {
 	return ctx.Context.GetSessionVars()
+}
+
+// GetTablesBuffer implements the MutateContext interface.
+func (ctx *TableContextImpl) GetTablesBuffer() *context.TablesBuffer {
+	return ctx.TablesBuffer
 }

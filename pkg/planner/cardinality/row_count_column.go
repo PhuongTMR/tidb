@@ -33,25 +33,29 @@ func init() {
 }
 
 // GetRowCountByColumnRanges estimates the row count by a slice of Range.
-func GetRowCountByColumnRanges(sctx context.PlanContext, coll *statistics.HistColl, colID int64, colRanges []*ranger.Range) (result float64, err error) {
+func GetRowCountByColumnRanges(sctx context.PlanContext, coll *statistics.HistColl, colUniqueID int64, colRanges []*ranger.Range) (result float64, err error) {
 	var name string
 	if sctx.GetSessionVars().StmtCtx.EnableOptimizerDebugTrace {
 		debugtrace.EnterContextCommon(sctx)
-		debugTraceGetRowCountInput(sctx, colID, colRanges)
+		debugTraceGetRowCountInput(sctx, colUniqueID, colRanges)
 		defer func() {
 			debugtrace.RecordAnyValuesWithNames(sctx, "Name", name, "Result", result)
 			debugtrace.LeaveContextCommon(sctx)
 		}()
 	}
 	sc := sctx.GetSessionVars().StmtCtx
-	c, ok := coll.Columns[colID]
-	recordUsedItemStatsStatus(sctx, c, coll.PhysicalID, colID)
+	c := coll.GetCol(colUniqueID)
+	colInfoID := colUniqueID
+	if len(coll.UniqueID2colInfoID) > 0 {
+		colInfoID = coll.UniqueID2colInfoID[colUniqueID]
+	}
+	recordUsedItemStatsStatus(sctx, c, coll.PhysicalID, colInfoID)
 	if c != nil && c.Info != nil {
 		name = c.Info.Name.O
 	}
-	if statistics.ColumnStatsIsInvalid(c, sctx, coll, colID) {
+	if statistics.ColumnStatsIsInvalid(c, sctx, coll, colUniqueID) {
 		result, err = getPseudoRowCountByColumnRanges(sc.TypeCtx(), float64(coll.RealtimeCount), colRanges, 0)
-		if err == nil && sc.EnableOptimizerCETrace && ok {
+		if err == nil && sc.EnableOptimizerCETrace && c != nil {
 			ceTraceRange(sctx, coll.PhysicalID, []string{c.Info.Name.O}, colRanges, "Column Stats-Pseudo", uint64(result))
 		}
 		return result, err
@@ -71,23 +75,27 @@ func GetRowCountByColumnRanges(sctx context.PlanContext, coll *statistics.HistCo
 }
 
 // GetRowCountByIntColumnRanges estimates the row count by a slice of IntColumnRange.
-func GetRowCountByIntColumnRanges(sctx context.PlanContext, coll *statistics.HistColl, colID int64, intRanges []*ranger.Range) (result float64, err error) {
+func GetRowCountByIntColumnRanges(sctx context.PlanContext, coll *statistics.HistColl, colUniqueID int64, intRanges []*ranger.Range) (result float64, err error) {
 	var name string
 	if sctx.GetSessionVars().StmtCtx.EnableOptimizerDebugTrace {
 		debugtrace.EnterContextCommon(sctx)
-		debugTraceGetRowCountInput(sctx, colID, intRanges)
+		debugTraceGetRowCountInput(sctx, colUniqueID, intRanges)
 		defer func() {
 			debugtrace.RecordAnyValuesWithNames(sctx, "Name", name, "Result", result)
 			debugtrace.LeaveContextCommon(sctx)
 		}()
 	}
 	sc := sctx.GetSessionVars().StmtCtx
-	c, ok := coll.Columns[colID]
-	recordUsedItemStatsStatus(sctx, c, coll.PhysicalID, colID)
+	c := coll.GetCol(colUniqueID)
+	colInfoID := colUniqueID
+	if len(coll.UniqueID2colInfoID) > 0 {
+		colInfoID = coll.UniqueID2colInfoID[colUniqueID]
+	}
+	recordUsedItemStatsStatus(sctx, c, coll.PhysicalID, colInfoID)
 	if c != nil && c.Info != nil {
 		name = c.Info.Name.O
 	}
-	if statistics.ColumnStatsIsInvalid(c, sctx, coll, colID) {
+	if statistics.ColumnStatsIsInvalid(c, sctx, coll, colUniqueID) {
 		if len(intRanges) == 0 {
 			return 0, nil
 		}
@@ -96,7 +104,7 @@ func GetRowCountByIntColumnRanges(sctx context.PlanContext, coll *statistics.His
 		} else {
 			result = getPseudoRowCountByUnsignedIntRanges(intRanges, float64(coll.RealtimeCount))
 		}
-		if sc.EnableOptimizerCETrace && ok {
+		if sc.EnableOptimizerCETrace && c != nil {
 			ceTraceRange(sctx, coll.PhysicalID, []string{c.Info.Name.O}, intRanges, "Column Stats-Pseudo", uint64(result))
 		}
 		return result, nil
@@ -317,7 +325,7 @@ func betweenRowCountOnColumn(sctx context.PlanContext, c *statistics.Column, l, 
 
 // ColumnGreaterRowCount estimates the row count where the column greater than value.
 func ColumnGreaterRowCount(sctx context.PlanContext, t *statistics.Table, value types.Datum, colID int64) float64 {
-	c := t.Columns[colID]
+	c := t.GetCol(colID)
 	if statistics.ColumnStatsIsInvalid(c, sctx, &t.HistColl, colID) {
 		return float64(t.RealtimeCount) / pseudoLessRate
 	}
@@ -326,7 +334,7 @@ func ColumnGreaterRowCount(sctx context.PlanContext, t *statistics.Table, value 
 
 // columnLessRowCount estimates the row count where the column less than value. Note that null values are not counted.
 func columnLessRowCount(sctx context.PlanContext, t *statistics.Table, value types.Datum, colID int64) float64 {
-	c := t.Columns[colID]
+	c := t.GetCol(colID)
 	if statistics.ColumnStatsIsInvalid(c, sctx, &t.HistColl, colID) {
 		return float64(t.RealtimeCount) / pseudoLessRate
 	}
@@ -336,7 +344,7 @@ func columnLessRowCount(sctx context.PlanContext, t *statistics.Table, value typ
 // columnBetweenRowCount estimates the row count where column greater or equal to a and less than b.
 func columnBetweenRowCount(sctx context.PlanContext, t *statistics.Table, a, b types.Datum, colID int64) (float64, error) {
 	sc := sctx.GetSessionVars().StmtCtx
-	c := t.Columns[colID]
+	c := t.GetCol(colID)
 	if statistics.ColumnStatsIsInvalid(c, sctx, &t.HistColl, colID) {
 		return float64(t.RealtimeCount) / pseudoBetweenRate, nil
 	}
@@ -359,7 +367,7 @@ func columnBetweenRowCount(sctx context.PlanContext, t *statistics.Table, a, b t
 
 // ColumnEqualRowCount estimates the row count where the column equals to value.
 func ColumnEqualRowCount(sctx context.PlanContext, t *statistics.Table, value types.Datum, colID int64) (float64, error) {
-	c := t.Columns[colID]
+	c := t.GetCol(colID)
 	if statistics.ColumnStatsIsInvalid(c, sctx, &t.HistColl, colID) {
 		return float64(t.RealtimeCount) / pseudoEqualRate, nil
 	}

@@ -61,7 +61,7 @@ func buildExpr(t *testing.T, ctx expression.BuildContext, exprNode any, opts ...
 func buildExprAndEval(t *testing.T, ctx expression.BuildContext, exprNode any) types.Datum {
 	expr, err := buildExpr(t, ctx, exprNode)
 	require.NoError(t, err)
-	val, err := expr.Eval(ctx, chunk.Row{})
+	val, err := expr.Eval(ctx.GetEvalCtx(), chunk.Row{})
 	require.NoError(t, err)
 	return val
 }
@@ -479,11 +479,11 @@ func TestBuildExpression(t *testing.T) {
 	// WithCastExprTo
 	expr, err = buildExpr(t, ctx, "1+2+3")
 	require.NoError(t, err)
-	require.Equal(t, mysql.TypeLonglong, expr.GetType().GetType())
+	require.Equal(t, mysql.TypeLonglong, expr.GetType(ctx).GetType())
 	castTo := types.NewFieldType(mysql.TypeVarchar)
 	expr, err = buildExpr(t, ctx, "1+2+3", expression.WithCastExprTo(castTo))
 	require.NoError(t, err)
-	require.Equal(t, mysql.TypeVarchar, expr.GetType().GetType())
+	require.Equal(t, mysql.TypeVarchar, expr.GetType(ctx).GetType())
 	v, err := expr.Eval(ctx, chunk.Row{})
 	require.NoError(t, err)
 	require.Equal(t, types.KindString, v.Kind())

@@ -161,12 +161,12 @@ func prefetchConflictedOldRows(ctx context.Context, txn kv.Transaction, rows []t
 		for _, uk := range r.uniqueKeys {
 			if val, found := values[string(uk.newKey)]; found {
 				if tablecodec.IsTempIndexKey(uk.newKey) {
-					// If it is a temp index, the value cannot be decoded by DecodeHandleInUniqueIndexValue.
+					// If it is a temp index, the value cannot be decoded by DecodeHandleInIndexValue.
 					// Since this function is an optimization, we can skip prefetching the rows referenced by
 					// temp indexes.
 					continue
 				}
-				handle, err := tablecodec.DecodeHandleInUniqueIndexValue(val, uk.commonHandle)
+				handle, err := tablecodec.DecodeHandleInIndexValue(val)
 				if err != nil {
 					return err
 				}
@@ -253,7 +253,7 @@ func (e *InsertExec) batchUpdateDupRows(ctx context.Context, newRows [][]types.D
 		}
 
 		for _, uk := range r.uniqueKeys {
-			_, handle, err := tables.FetchDuplicatedHandle(ctx, uk.newKey, true, txn, e.Table.Meta().ID, uk.commonHandle)
+			_, handle, err := tables.FetchDuplicatedHandle(ctx, uk.newKey, true, txn, e.Table.Meta().ID)
 			if err != nil {
 				return err
 			}
@@ -396,14 +396,14 @@ func (e *InsertExec) doDupRowUpdate(ctx context.Context, handle kv.Handle, oldRo
 	// Update old row when the key is duplicated.
 	e.evalBuffer4Dup.SetDatums(e.row4Update...)
 	sctx := e.Ctx()
-	exprCtx := sctx.GetExprCtx()
+	evalCtx := sctx.GetExprCtx().GetEvalCtx()
 	sc := sctx.GetSessionVars().StmtCtx
 	warnCnt := int(sc.WarningCount())
 	for _, col := range cols {
 		if col.LazyErr != nil {
 			return col.LazyErr
 		}
-		val, err1 := col.Expr.Eval(exprCtx, e.evalBuffer4Dup.ToRow())
+		val, err1 := col.Expr.Eval(evalCtx, e.evalBuffer4Dup.ToRow())
 		if err1 != nil {
 			return err1
 		}

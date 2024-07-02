@@ -71,7 +71,7 @@ func (e *SetExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
 				}
 				continue
 			}
-			dt, err := v.Expr.(*expression.Constant).Eval(sctx.GetExprCtx(), chunk.Row{})
+			dt, err := v.Expr.(*expression.Constant).Eval(sctx.GetExprCtx().GetEvalCtx(), chunk.Row{})
 			if err != nil {
 				return err
 			}
@@ -89,7 +89,7 @@ func (e *SetExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
 		name := strings.ToLower(v.Name)
 		if !v.IsSystem {
 			// Set user variable.
-			value, err := v.Expr.Eval(sctx.GetExprCtx(), chunk.Row{})
+			value, err := v.Expr.Eval(sctx.GetExprCtx().GetEvalCtx(), chunk.Row{})
 			if err != nil {
 				return err
 			}
@@ -97,7 +97,7 @@ func (e *SetExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
 				sessionVars.UnsetUserVar(name)
 			} else {
 				sessionVars.SetUserVarVal(name, value)
-				sessionVars.SetUserVarType(name, v.Expr.GetType())
+				sessionVars.SetUserVarType(name, v.Expr.GetType(sctx.GetExprCtx().GetEvalCtx()))
 			}
 			continue
 		}
@@ -306,7 +306,7 @@ func (e *SetExecutor) getVarValue(ctx context.Context, v *expression.VarAssignme
 		}
 		return e.Ctx().GetSessionVars().GetGlobalSystemVar(ctx, v.Name)
 	}
-	nativeVal, err := v.Expr.Eval(e.Ctx().GetExprCtx(), chunk.Row{})
+	nativeVal, err := v.Expr.Eval(e.Ctx().GetExprCtx().GetEvalCtx(), chunk.Row{})
 	if err != nil || nativeVal.IsNull() {
 		return "", err
 	}

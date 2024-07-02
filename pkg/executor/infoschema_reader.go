@@ -40,7 +40,6 @@ import (
 	"github.com/pingcap/tidb/pkg/executor/internal/exec"
 	"github.com/pingcap/tidb/pkg/executor/internal/pdhelper"
 	"github.com/pingcap/tidb/pkg/expression"
-	"github.com/pingcap/tidb/pkg/expression/contextimpl"
 	"github.com/pingcap/tidb/pkg/infoschema"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta/autoid"
@@ -49,6 +48,7 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	plannercore "github.com/pingcap/tidb/pkg/planner/core"
+	"github.com/pingcap/tidb/pkg/planner/core/base"
 	"github.com/pingcap/tidb/pkg/privilege"
 	"github.com/pingcap/tidb/pkg/privilege/privileges"
 	"github.com/pingcap/tidb/pkg/session/txninfo"
@@ -77,7 +77,6 @@ import (
 	"github.com/pingcap/tidb/pkg/util/sem"
 	"github.com/pingcap/tidb/pkg/util/servermemorylimit"
 	"github.com/pingcap/tidb/pkg/util/set"
-	"github.com/pingcap/tidb/pkg/util/sqlexec"
 	"github.com/pingcap/tidb/pkg/util/stringutil"
 	"github.com/pingcap/tidb/pkg/util/syncutil"
 	"github.com/tikv/client-go/v2/tikv"
@@ -95,7 +94,7 @@ type memtableRetriever struct {
 	rowIdx      int
 	retrieved   bool
 	initialized bool
-	extractor   plannercore.MemTablePredicateExtractor
+	extractor   base.MemTablePredicateExtractor
 	is          infoschema.InfoSchema
 	memTracker  *memory.Tracker
 }
@@ -308,7 +307,7 @@ func (e *memtableRetriever) setDataForVariablesInfo(ctx sessionctx.Context) erro
 }
 
 func (e *memtableRetriever) setDataForUserAttributes(ctx context.Context, sctx sessionctx.Context) error {
-	exec, _ := sctx.(sqlexec.RestrictedSQLExecutor)
+	exec := sctx.GetRestrictedSQLExecutor()
 	chunkRows, _, err := exec.ExecRestrictedSQL(ctx, nil, `SELECT user, host, JSON_UNQUOTE(JSON_EXTRACT(user_attributes, '$.metadata')) FROM mysql.user`)
 	if err != nil {
 		return err
@@ -536,7 +535,7 @@ func (e *memtableRetriever) setDataFromReferConst(sctx sessionctx.Context, schem
 
 func (e *memtableRetriever) updateStatsCacheIfNeed() bool {
 	for _, col := range e.columns {
-		// only the following columns need stats cahce.
+		// only the following columns need stats cache.
 		if col.Name.O == "AVG_ROW_LENGTH" || col.Name.O == "DATA_LENGTH" || col.Name.O == "INDEX_LENGTH" || col.Name.O == "TABLE_ROWS" {
 			return true
 		}
@@ -860,7 +859,7 @@ func (e *hugeMemTableRetriever) dataForColumnsInTable(ctx context.Context, sctx 
 		e.viewMu.Lock()
 		_, ok := e.viewSchemaMap[tbl.ID]
 		if !ok {
-			var viewLogicalPlan plannercore.Plan
+			var viewLogicalPlan base.Plan
 			internalCtx := kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers)
 			// Build plan is not thread safe, there will be concurrency on sessionctx.
 			if err := runWithSystemSession(internalCtx, sctx, func(s sessionctx.Context) error {
@@ -923,7 +922,7 @@ ForColumnsTag:
 				idx := expression.FindFieldNameIdxByColName(e.viewOutputNamesMap[tbl.ID], col.Name.L)
 				if idx >= 0 {
 					col1 := e.viewSchemaMap[tbl.ID].Columns[idx]
-					ft = col1.GetType()
+					ft = col1.GetType(sctx.GetExprCtx().GetEvalCtx())
 				}
 			}
 			e.viewMu.RUnlock()
@@ -1250,6 +1249,7 @@ func (e *memtableRetriever) setDataFromIndexes(ctx sessionctx.Context, schemas [
 					0,            // INDEX_ID
 					"YES",        // IS_VISIBLE
 					"YES",        // CLUSTERED
+					0,            // IS_GLOBAL
 				)
 				rows = append(rows, record)
 			}
@@ -1295,6 +1295,7 @@ func (e *memtableRetriever) setDataFromIndexes(ctx sessionctx.Context, schemas [
 						idxInfo.ID,      // INDEX_ID
 						visible,         // IS_VISIBLE
 						isClustered,     // CLUSTERED
+						idxInfo.Global,  // IS_GLOBAL
 					)
 					rows = append(rows, record)
 				}
@@ -1757,7 +1758,7 @@ func keyColumnUsageInTable(schema model.CIStr, table *model.TableInfo) [][]types
 				col.Name.O,            // COLUMN_NAME
 				i+1,                   // ORDINAL_POSITION,
 				1,                     // POSITION_IN_UNIQUE_CONSTRAINT
-				schema.O,              // REFERENCED_TABLE_SCHEMA
+				fk.RefSchema.O,        // REFERENCED_TABLE_SCHEMA
 				fk.RefTable.O,         // REFERENCED_TABLE_NAME
 				fkRefCol,              // REFERENCED_COLUMN_NAME
 			)
@@ -1767,20 +1768,18 @@ func keyColumnUsageInTable(schema model.CIStr, table *model.TableInfo) [][]types
 	return rows
 }
 
-func ensureSchemaTables(is infoschema.InfoSchema, schemas []*model.DBInfo) []*model.DBInfo {
-	res := schemas[:0]
-	for _, db := range schemas {
-		if len(db.Tables) == 0 {
-			// For infoschema v2, Tables of DBInfo could be missing.
-			dbInfo := db.Clone()
-			tbls := is.SchemaTables(db.Name)
-			for _, tbl := range tbls {
-				dbInfo.Tables = append(dbInfo.Tables, tbl.Meta())
-			}
-			res = append(res, dbInfo)
-		} else {
-			res = append(res, db)
+func ensureSchemaTables(is infoschema.InfoSchema, schemaNames []model.CIStr) []*model.DBInfo {
+	// For infoschema v2, Tables of DBInfo could be missing.
+	res := make([]*model.DBInfo, 0, len(schemaNames))
+	for _, dbName := range schemaNames {
+		dbInfoRaw, _ := is.SchemaByName(dbName)
+		dbInfo := dbInfoRaw.Clone()
+		dbInfo.Tables = dbInfo.Tables[:0]
+		tbls := is.SchemaTables(dbName)
+		for _, tbl := range tbls {
+			dbInfo.Tables = append(dbInfo.Tables, tbl.Meta())
 		}
+		res = append(res, dbInfo)
 	}
 	return res
 }
@@ -1826,8 +1825,8 @@ func (e *memtableRetriever) setDataForTiKVRegionStatus(ctx context.Context, sctx
 			return err
 		}
 	}
-	schemas := is.AllSchemas()
-	schemas = ensureSchemaTables(is, schemas)
+	schemaNames := is.AllSchemaNames()
+	schemas := ensureSchemaTables(is, schemaNames)
 	tableInfos := tikvHelper.GetRegionsTableInfo(allRegionsInfo, schemas)
 	for i := range allRegionsInfo.Regions {
 		regionTableList := tableInfos[allRegionsInfo.Regions[i].ID]
@@ -1951,17 +1950,17 @@ func (e *memtableRetriever) setDataForTiDBHotRegions(ctx context.Context, sctx s
 	if !ok {
 		return errors.New("Information about hot region can be gotten only when the storage is TiKV")
 	}
-	allSchemas := sctx.GetInfoSchema().(infoschema.InfoSchema).AllSchemas()
 	tikvHelper := &helper.Helper{
 		Store:       tikvStore,
 		RegionCache: tikvStore.GetRegionCache(),
 	}
-	metrics, err := tikvHelper.ScrapeHotInfo(ctx, helper.HotRead, allSchemas)
+	schemas := tikvHelper.FilterMemDBs(sessiontxn.GetTxnManager(sctx).GetTxnInfoSchema().AllSchemas())
+	metrics, err := tikvHelper.ScrapeHotInfo(ctx, helper.HotRead, schemas)
 	if err != nil {
 		return err
 	}
 	e.setDataForHotRegionByMetrics(metrics, "read")
-	metrics, err = tikvHelper.ScrapeHotInfo(ctx, helper.HotWrite, allSchemas)
+	metrics, err = tikvHelper.ScrapeHotInfo(ctx, helper.HotWrite, schemas)
 	if err != nil {
 		return err
 	}
@@ -2223,7 +2222,7 @@ func (e *tableStorageStatsRetriever) setDataForTableStorageStats(ctx context.Con
 func dataForAnalyzeStatusHelper(ctx context.Context, sctx sessionctx.Context) (rows [][]types.Datum, err error) {
 	const maxAnalyzeJobs = 30
 	const sql = "SELECT table_schema, table_name, partition_name, job_info, processed_rows, CONVERT_TZ(start_time, @@TIME_ZONE, '+00:00'), CONVERT_TZ(end_time, @@TIME_ZONE, '+00:00'), state, fail_reason, instance, process_id FROM mysql.analyze_jobs ORDER BY update_time DESC LIMIT %?"
-	exec := sctx.(sqlexec.RestrictedSQLExecutor)
+	exec := sctx.GetRestrictedSQLExecutor()
 	kctx := kv.WithInternalSourceType(context.Background(), kv.InternalTxnStats)
 	chunkRows, _, err := exec.ExecRestrictedSQL(kctx, nil, sql, maxAnalyzeJobs)
 	if err != nil {
@@ -2719,11 +2718,9 @@ func (e *tidbTrxTableRetriever) retrieve(ctx context.Context, sctx sessionctx.Co
 		e.batchRetrieverHelper.batchSize = 1024
 	}
 
-	sqlExec, err := contextimpl.NewSQLExecutor(sctx)
-	if err != nil {
-		return nil, err
-	}
+	sqlExec := sctx.GetRestrictedSQLExecutor()
 
+	var err error
 	// The current TiDB node's address is needed by the CLUSTER_TIDB_TRX table.
 	var instanceAddr string
 	if e.table.Name.O == infoschema.ClusterTableTiDBTrx {
@@ -2872,12 +2869,7 @@ func (r *dataLockWaitsTableRetriever) retrieve(ctx context.Context, sctx session
 				}
 			}
 
-			sqlExec, err := contextimpl.NewSQLExecutor(sctx)
-			if err != nil {
-				return errors.Trace(err)
-			}
-
-			err = sqlRetriever.RetrieveGlobal(ctx, sqlExec)
+			err := sqlRetriever.RetrieveGlobal(ctx, sctx.GetRestrictedSQLExecutor())
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -3075,11 +3067,7 @@ func (r *deadlocksTableRetriever) retrieve(ctx context.Context, sctx sessionctx.
 		}
 		// Retrieve the SQL texts if necessary.
 		if sqlRetriever != nil {
-			sqlExec, err := contextimpl.NewSQLExecutor(sctx)
-			if err != nil {
-				return errors.Trace(err)
-			}
-			err1 := sqlRetriever.RetrieveGlobal(ctx, sqlExec)
+			err1 := sqlRetriever.RetrieveGlobal(ctx, sctx.GetRestrictedSQLExecutor())
 			if err1 != nil {
 				return errors.Trace(err1)
 			}

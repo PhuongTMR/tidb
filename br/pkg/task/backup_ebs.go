@@ -26,6 +26,7 @@ import (
 	"github.com/pingcap/tidb/br/pkg/config"
 	"github.com/pingcap/tidb/br/pkg/conn"
 	"github.com/pingcap/tidb/br/pkg/conn/util"
+	berrors "github.com/pingcap/tidb/br/pkg/errors"
 	"github.com/pingcap/tidb/br/pkg/glue"
 	"github.com/pingcap/tidb/br/pkg/metautil"
 	"github.com/pingcap/tidb/br/pkg/pdutil"
@@ -33,6 +34,7 @@ import (
 	"github.com/pingcap/tidb/br/pkg/summary"
 	"github.com/pingcap/tidb/br/pkg/utils"
 	"github.com/pingcap/tidb/br/pkg/version"
+	tidbutil "github.com/pingcap/tidb/pkg/util"
 	"github.com/spf13/pflag"
 	"github.com/tikv/client-go/v2/tikv"
 	"go.uber.org/multierr"
@@ -99,7 +101,7 @@ func RunBackupEBS(c context.Context, g glue.Glue, cfg *BackupConfig) error {
 	storeCount := backupInfo.GetStoreCount()
 	if storeCount == 0 {
 		log.Info("nothing to backup")
-		return nil
+		return errors.Trace(errors.Annotate(berrors.ErrInvalidArgument, "store count is 0"))
 	}
 
 	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
@@ -340,7 +342,7 @@ func isRegionsHasHole(allRegions []*metapb.Region) bool {
 
 func waitUntilAllScheduleStopped(ctx context.Context, cfg Config, allStores []*metapb.Store, mgr *conn.Mgr) ([]*metapb.Region, error) {
 	concurrency := min(len(allStores), common.MaxStoreConcurrency)
-	workerPool := utils.NewWorkerPool(uint(concurrency), "collect schedule info")
+	workerPool := tidbutil.NewWorkerPool(uint(concurrency), "collect schedule info")
 	eg, ectx := errgroup.WithContext(ctx)
 
 	// init this slice with guess that there are 100 leaders on each store

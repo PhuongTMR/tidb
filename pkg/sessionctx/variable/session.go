@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/tidb/pkg/config"
 	"github.com/pingcap/tidb/pkg/domain/resourcegroup"
 	"github.com/pingcap/tidb/pkg/errctx"
@@ -199,6 +200,7 @@ type TxnCtxNoNeedToRestore struct {
 	InfoSchema  any
 	History     any
 	StartTS     uint64
+	StaleReadTs uint64
 
 	// ShardStep indicates the max size of continuous rowid shard in one transaction.
 	ShardStep    int
@@ -319,6 +321,35 @@ func (tc *TransactionContext) UpdateDeltaForTable(physicalTableID int64, delta i
 	item.TableID = physicalTableID
 	for key, val := range colSize {
 		item.ColSize[key] += val
+	}
+	tc.TableDeltaMap[physicalTableID] = item
+}
+
+// ColSize is a data struct to store the delta information for a table.
+type ColSize struct {
+	ColID int64
+	Size  int64
+}
+
+// UpdateDeltaForTableFromColSlice is the same as UpdateDeltaForTable, but it accepts a slice of column size.
+func (tc *TransactionContext) UpdateDeltaForTableFromColSlice(
+	physicalTableID int64, delta int64,
+	count int64, colSizes []ColSize,
+) {
+	tc.tdmLock.Lock()
+	defer tc.tdmLock.Unlock()
+	if tc.TableDeltaMap == nil {
+		tc.TableDeltaMap = make(map[int64]TableDelta)
+	}
+	item := tc.TableDeltaMap[physicalTableID]
+	if item.ColSize == nil && len(colSizes) > 0 {
+		item.ColSize = make(map[int64]int64, len(colSizes))
+	}
+	item.Delta += delta
+	item.Count += count
+	item.TableID = physicalTableID
+	for _, s := range colSizes {
+		item.ColSize[s.ColID] += s.Size
 	}
 	tc.TableDeltaMap[physicalTableID] = item
 }
@@ -449,7 +480,7 @@ func (tc *TransactionContext) ReleaseSavepoint(name string) bool {
 	name = strings.ToLower(name)
 	for i, sp := range tc.Savepoints {
 		if sp.Name == name {
-			tc.Savepoints = append(tc.Savepoints[:i])
+			tc.Savepoints = tc.Savepoints[:i]
 			return true
 		}
 	}
@@ -707,7 +738,7 @@ type SessionVars struct {
 	ActiveRoles []*auth.RoleIdentity
 
 	RetryInfo *RetryInfo
-	//  TxnCtx Should be reset on transaction finished.
+	// TxnCtx Should be reset on transaction finished.
 	TxnCtx *TransactionContext
 	// TxnCtxMu is used to protect TxnCtx.
 	TxnCtxMu sync.Mutex
@@ -1202,7 +1233,7 @@ type SessionVars struct {
 	// PresumeKeyNotExists indicates lazy existence checking is enabled.
 	PresumeKeyNotExists bool
 
-	// EnableParallelApply indicates that thether to use parallel apply.
+	// EnableParallelApply indicates that whether to use parallel apply.
 	EnableParallelApply bool
 
 	// EnableRedactLog indicates that whether redact log. Possible values are 'OFF', 'ON', 'MARKER'.
@@ -1289,7 +1320,7 @@ type SessionVars struct {
 	// ReadStaleness indicates the staleness duration for the following query
 	ReadStaleness time.Duration
 
-	// cachedStmtCtx is used to optimze the object allocation.
+	// cachedStmtCtx is used to optimize the object allocation.
 	cachedStmtCtx [2]stmtctx.StatementContext
 
 	// Rng stores the rand_seed1 and rand_seed2 for Rand() function
@@ -1306,7 +1337,7 @@ type SessionVars struct {
 	ReadConsistency ReadConsistencyLevel
 
 	// StatsLoadSyncWait indicates how long to wait for stats load before timeout.
-	StatsLoadSyncWait int64
+	StatsLoadSyncWait atomic.Int64
 
 	// EnableParallelHashaggSpill indicates if parallel hash agg could spill.
 	EnableParallelHashaggSpill bool
@@ -1484,7 +1515,7 @@ type SessionVars struct {
 	shardRand *rand.Rand
 
 	// Resource group name
-	// NOTE: all statement relate opeartion should use StmtCtx.ResourceGroupName instead.
+	// NOTE: all statement relate operation should use StmtCtx.ResourceGroupName instead.
 	ResourceGroupName string
 
 	// PessimisticTransactionFairLocking controls whether fair locking for pessimistic transaction
@@ -1581,6 +1612,12 @@ type SessionVars struct {
 	// DivPrecisionIncrement indicates the number of digits by which to increase the scale of the result
 	// of division operations performed with the / operator.
 	DivPrecisionIncrement int
+
+	// allowed when tikv disk full happened.
+	DiskFullOpt kvrpcpb.DiskFullOpt
+
+	// GroupConcatMaxLen represents the maximum length of the result of GROUP_CONCAT.
+	GroupConcatMaxLen uint64
 }
 
 // GetOptimizerFixControlMap returns the specified value of the optimizer fix control.
@@ -1619,7 +1656,7 @@ func (s *SessionVars) IsPlanReplayerCaptureEnabled() bool {
 	return s.EnablePlanReplayerCapture || s.EnablePlanReplayedContinuesCapture
 }
 
-// GetChunkAllocator returns a vaid chunk allocator.
+// GetChunkAllocator returns a valid chunk allocator.
 func (s *SessionVars) GetChunkAllocator() chunk.Allocator {
 	if s.chunkPool == nil {
 		return chunk.NewEmptyAllocator()
@@ -2019,7 +2056,6 @@ func NewSessionVars(hctx HookContext) *SessionVars {
 		TMPTableSize:                  DefTiDBTmpTableMaxSize,
 		MPPStoreFailTTL:               DefTiDBMPPStoreFailTTL,
 		Rng:                           mathutil.NewWithTime(),
-		StatsLoadSyncWait:             StatsLoadSyncWait.Load(),
 		EnableLegacyInstanceScope:     DefEnableLegacyInstanceScope,
 		RemoveOrderbyInSubquery:       DefTiDBRemoveOrderbyInSubquery,
 		EnableSkewDistinctAgg:         DefTiDBSkewDistinctAgg,
@@ -2038,6 +2074,8 @@ func NewSessionVars(hctx HookContext) *SessionVars {
 		TiFlashComputeDispatchPolicy:  tiflashcompute.DispatchPolicyConsistentHash,
 		ResourceGroupName:             resourcegroup.DefaultResourceGroupName,
 		DefaultCollationForUTF8MB4:    mysql.DefaultCollationName,
+		GroupConcatMaxLen:             DefGroupConcatMaxLen,
+		EnableRedactLog:               DefTiDBRedactLog,
 	}
 	vars.status.Store(uint32(mysql.ServerStatusAutocommit))
 	vars.StmtCtx.ResourceGroupName = resourcegroup.DefaultResourceGroupName
@@ -2086,6 +2124,7 @@ func NewSessionVars(hctx HookContext) *SessionVars {
 	vars.MemTracker = memory.NewTracker(memory.LabelForSession, vars.MemQuotaQuery)
 	vars.MemTracker.IsRootTrackerOfSess = true
 	vars.MemTracker.Killer = &vars.SQLKiller
+	vars.StatsLoadSyncWait.Store(StatsLoadSyncWait.Load())
 
 	for _, engine := range config.GetGlobalConfig().IsolationRead.Engines {
 		switch engine {
@@ -2372,7 +2411,7 @@ func (s *SessionVars) SetTxnIsolationLevelOneShotStateForNextTxn() {
 	}
 }
 
-// IsPessimisticReadConsistency if true it means the statement is in an read consistency pessimistic transaction.
+// IsPessimisticReadConsistency if true it means the statement is in a read consistency pessimistic transaction.
 func (s *SessionVars) IsPessimisticReadConsistency() bool {
 	return s.TxnCtx.IsPessimistic && s.IsIsolation(ast.ReadCommitted)
 }
@@ -3087,7 +3126,7 @@ const (
 	SlowLogCopBackoffPrefix = "Cop_backoff_"
 	// SlowLogMemMax is the max number bytes of memory used in this statement.
 	SlowLogMemMax = "Mem_max"
-	// SlowLogDiskMax is the nax number bytes of disk used in this statement.
+	// SlowLogDiskMax is the max number bytes of disk used in this statement.
 	SlowLogDiskMax = "Disk_max"
 	// SlowLogPrepared is used to indicate whether this sql execute in prepare.
 	SlowLogPrepared = "Prepared"
@@ -3598,6 +3637,16 @@ func (s *SessionVars) GetRelatedTableForMDL() *sync.Map {
 	return s.TxnCtx.relatedTableForMDL
 }
 
+// ClearRelatedTableForMDL clears the related table for MDL.
+// related tables for MDL is filled during build logical plan or Preprocess for all DataSources,
+// even for queries inside DDLs like `create view as select xxx` and `create table as select xxx`.
+// it should be cleared before we execute the DDL statement.
+func (s *SessionVars) ClearRelatedTableForMDL() {
+	s.TxnCtx.tdmLock.Lock()
+	defer s.TxnCtx.tdmLock.Unlock()
+	s.TxnCtx.relatedTableForMDL = nil
+}
+
 // EnableForceInlineCTE returns the session variable enableForceInlineCTE
 func (s *SessionVars) EnableForceInlineCTE() bool {
 	return s.enableForceInlineCTE
@@ -3631,6 +3680,21 @@ func (s *SessionVars) GetTiKVClientReadTimeout() uint64 {
 	return s.TiKVClientReadTimeout
 }
 
+// SetDiskFullOpt sets the session variable DiskFullOpt
+func (s *SessionVars) SetDiskFullOpt(level kvrpcpb.DiskFullOpt) {
+	s.DiskFullOpt = level
+}
+
+// GetDiskFullOpt returns the value of DiskFullOpt in the current session.
+func (s *SessionVars) GetDiskFullOpt() kvrpcpb.DiskFullOpt {
+	return s.DiskFullOpt
+}
+
+// ClearDiskFullOpt resets the session variable DiskFullOpt to DiskFullOpt_NotAllowedOnFull.
+func (s *SessionVars) ClearDiskFullOpt() {
+	s.DiskFullOpt = kvrpcpb.DiskFullOpt_NotAllowedOnFull
+}
+
 // RuntimeFilterType type of runtime filter "IN"
 type RuntimeFilterType int64
 
@@ -3657,7 +3721,7 @@ func (rfType RuntimeFilterType) String() string {
 // RuntimeFilterTypeStringToType convert RuntimeFilterTypeNameString to RuntimeFilterType
 // If name is legal, it will return Runtime Filter Type and true
 // Else, it will return -1 and false
-// The second param means the convert is ok or not. Ture is ok, false means it is illegal name
+// The second param means the convert is ok or not. True is ok, false means it is illegal name
 // At present, we only support two names: "IN" and "MIN_MAX"
 func RuntimeFilterTypeStringToType(name string) (RuntimeFilterType, bool) {
 	switch name {
@@ -3672,7 +3736,7 @@ func RuntimeFilterTypeStringToType(name string) (RuntimeFilterType, bool) {
 
 // ToRuntimeFilterType convert session var value to RuntimeFilterType list
 // If sessionVarValue is legal, it will return RuntimeFilterType list and true
-// The second param means the convert is ok or not. Ture is ok, false means it is illegal value
+// The second param means the convert is ok or not. True is ok, false means it is illegal value
 // The legal value should be comma-separated, eg: "IN,MIN_MAX"
 func ToRuntimeFilterType(sessionVarValue string) ([]RuntimeFilterType, bool) {
 	typeNameList := strings.Split(sessionVarValue, ",")
@@ -3720,7 +3784,7 @@ func (rfMode RuntimeFilterMode) String() string {
 // RuntimeFilterModeStringToMode convert RuntimeFilterModeString to RuntimeFilterMode
 // If name is legal, it will return Runtime Filter Mode and true
 // Else, it will return -1 and false
-// The second param means the convert is ok or not. Ture is ok, false means it is illegal name
+// The second param means the convert is ok or not. True is ok, false means it is illegal name
 // At present, we only support one name: "OFF", "LOCAL"
 func RuntimeFilterModeStringToMode(name string) (RuntimeFilterMode, bool) {
 	switch name {
